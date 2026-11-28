@@ -382,7 +382,7 @@ test("coverage file uploads send report text as written under relative names", a
     root,
     files: [
       "lcov.info",
-      { path: join(root, "go.out"), name: "go/coverage.out" },
+      { path: join(root, "go.out"), name: "go/coverage:nightly.out" },
     ],
   });
   assert.equal(result.created, true);
@@ -395,7 +395,7 @@ test("coverage file uploads send report text as written under relative names", a
     tested_sha: "c".repeat(40),
     reports: [
       { name: "lcov.info", content: lcov },
-      { name: "go/coverage.out", content: go },
+      { name: "go/coverage:nightly.out", content: go },
     ],
   });
 });
@@ -416,6 +416,10 @@ test("coverage file uploads refuse locally what the server would refuse", async 
   const refusals = [
     [{ tested_sha: "main", files: ["lcov.info"] }, /full 40-character/],
     [{ tested_sha: "c".repeat(12), files: ["lcov.info"] }, /full 40-character/],
+    [
+      { tested_sha: sha.toUpperCase(), files: ["lcov.info"] },
+      /full 40-character/,
+    ],
     [{ tested_sha: sha, files: [] }, /1 to 50/],
     [{ tested_sha: sha, files: Array(51).fill("lcov.info") }, /1 to 50/],
     [
@@ -431,17 +435,33 @@ test("coverage file uploads refuse locally what the server would refuse", async 
       /inside root/,
     ],
     [
+      {
+        tested_sha: sha,
+        files: [{ path: "lcov.info", name: "C:/coverage/lcov.info" }],
+      },
+      /inside root/,
+    ],
+    [
+      {
+        tested_sha: sha,
+        files: [{ path: "lcov.info", name: "report\0.info" }],
+      },
+      /inside root/,
+    ],
+    [
       { tested_sha: sha, files: [{ path: "lcov.info", name: "a/../b.info" }] },
       /inside root/,
     ],
     [{ tested_sha: sha, files: ["report.gz"] }, /report\.gz is not UTF-8/],
     [{ tested_sha: sha, files: ["huge.info"] }, /30 MiB/],
   ];
-  for (const [upload, message] of refusals)
+  for (const [upload, message] of refusals) {
     await assert.rejects(
       client.uploadCoverageFiles(parameters, { root, ...upload }),
       (error) => error instanceof TypeError && message.test(error.message),
     );
+    assert.equal(fixture.calls.length, 0);
+  }
   await assert.rejects(
     client.uploadCoverageFiles(parameters, {
       tested_sha: sha,
@@ -1511,12 +1531,12 @@ test("pagination keeps filters and refuses cycles, incomplete metadata and resou
   let mode = "normal";
   const fixture = await server(t, (request, response) => {
     if (mode === "malformed") return json(response, 200, null);
-    const cursor = new URL(request.url, "http://127.0.0.1").searchParams.get(
-      "cursor",
-    );
-    const more = mode !== "normal" || cursor === null;
+    const query = new URL(request.url, "http://127.0.0.1").searchParams;
+    const cursor = query.get("cursor");
+    const more = mode !== "normal" || cursor !== "next";
+    const id = cursor === "next" ? "second" : "first";
     return json(response, 200, {
-      items: [{ id: cursor ? "second" : "first" }],
+      items: [{ id: query.get("repository") === repoId ? id : "other-repo" }],
       truncated: more,
       next_cursor: mode === "missing" ? null : more ? "next" : null,
       filters: { repositories: [], environments: [], authors: [] },
@@ -1524,13 +1544,29 @@ test("pagination keeps filters and refuses cycles, incomplete metadata and resou
   });
   const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
   const parameters = { path: { org_id: orgId }, query: { repository: repoId } };
-  const items = await Array.fromAsync(client.iterReviews(parameters));
+  const query = { ...parameters.query, status: "COMPLETED", cursor: "resume" };
+  const reviews = client.iterReviews({ ...parameters, query });
+  assert.equal((await reviews.next()).value.id, "first");
+  query.repository = "00000000-0000-7000-8000-000000000005";
+  query.status = "FAILED";
+  const items = await Array.fromAsync(reviews);
   assert.deepEqual(
     items.map((item) => item.id),
-    ["first", "second"],
+    ["second"],
   );
-  assert(
-    fixture.calls.every(({ url }) => url.includes(`repository=${repoId}`)),
+  assert.deepEqual(
+    fixture.calls.map(({ url }) => {
+      const query = new URL(url, "http://127.0.0.1").searchParams;
+      return [
+        query.get("repository"),
+        query.get("status"),
+        query.get("cursor"),
+      ];
+    }),
+    [
+      [repoId, "COMPLETED", "resume"],
+      [repoId, "COMPLETED", "next"],
+    ],
   );
   mode = "cycle";
   await assert.rejects(
